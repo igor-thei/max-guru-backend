@@ -2,7 +2,18 @@
 const Anthropic = require('@anthropic-ai/sdk');
 const https = require('https');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const { loadKnowledge, searchKnowledge, getKnowledgeByKey } = require('../knowledge/loader');
+
+// Sunfire plan ID → plan name/carrier map (built 2026-07-23)
+let SUNFIRE_PLAN_MAP = {};
+try {
+  SUNFIRE_PLAN_MAP = JSON.parse(fs.readFileSync(path.join(__dirname, 'sunfire-id-map.json'), 'utf8'));
+  console.log(`[claude.js] Sunfire plan map loaded: ${Object.keys(SUNFIRE_PLAN_MAP).length} plans`);
+} catch(e) {
+  console.warn('[claude.js] sunfire-id-map.json not found — Sunfire lookups will return raw IDs');
+}
 
 // Whitelisted domains Max can fetch from
 const ALLOWED_DOMAINS = [
@@ -230,7 +241,7 @@ async function processTool(toolName, toolInput) {
       const SUNFIRE_BASE = 'https://www.sunfirematrix.com';
       const SUNFIRE_JWT = process.env.SUNFIRE_JWT || '';
       const SUNFIRE_SFP = process.env.SUNFIRE_SFP || '';
-      const sunfirePlans = {};
+      const sunfireInNetwork = []; // resolved plan name strings
       if (SUNFIRE_JWT && SUNFIRE_SFP && providerResults.length > 0) {
         try {
           const sfProviders = providerResults.map(pr => ({
@@ -256,17 +267,25 @@ async function processTool(toolName, toolInput) {
             const sfPlans = sfData.plans || [];
             for (const plan of sfPlans) {
               const docs = plan.doctorInformation || [];
-              for (const doc of docs) {
-                if (doc.covered === 'Y' && (doc.locations || []).some(l => l.covered === 'Y')) {
-                  sunfirePlans[plan.id] = sunfirePlans[plan.id] || [];
-                  sunfirePlans[plan.id].push(doc.id);
-                }
+              const covered = docs.some(doc =>
+                doc.covered === 'Y' && (doc.locations || []).some(l => l.covered === 'Y')
+              );
+              if (!covered) continue;
+              const id = String(plan.id);
+              const mapEntry = SUNFIRE_PLAN_MAP[id];
+              let label;
+              if (mapEntry) {
+                label = mapEntry.planName
+                  ? `${mapEntry.planName} (${mapEntry.carrier})`
+                  : (mapEntry.carrier || `Plan ${id}`);
+              } else {
+                label = `Plan ID ${id}`;
               }
+              if (!sunfireInNetwork.includes(label)) sunfireInNetwork.push(label);
             }
           }
         } catch(e) { console.log('[Sunfire lookup error]', e.message); }
       }
-      const sunfirePlanCount = Object.keys(sunfirePlans).length;
 
       let out = `Provider network results for "${doctorName}":\n\n`;
       for (const pr of providerResults) {
@@ -274,12 +293,12 @@ async function processTool(toolName, toolInput) {
         out += `Specialty: ${pr.specialty}\n`;
         out += `Address: ${pr.address}\n`;
         const allNetworks = [...pr.inNetworkFor];
-        if (sunfirePlanCount > 0) {
+        if (sunfireInNetwork.length > 0) {
           out += allNetworks.length ? `FHIR networks: ${allNetworks.join(', ')}\n` : `Not found in FL Blue, Cigna, HealthSun, or Devoted.\n`;
-          out += `Sunfire networks: Found in ${sunfirePlanCount} plan(s) — UHC/Humana/WellCare/CarePlus area. Confirm plan names in Sunfire for enrollment.\n`;
+          out += `Sunfire in-network plans (${sunfireInNetwork.length}):\n${sunfireInNetwork.map(p => `  - ${p}`).join('\n')}\n`;
         } else {
           out += allNetworks.length ? `In-network for: ${allNetworks.join(', ')}\n` : `Not found in FL Blue, Cigna, HealthSun, or Devoted networks.\n`;
-          out += sunfirePlanCount === 0 && SUNFIRE_SFP ? `Sunfire: No active plans found.\n` : `Sunfire: Session expired — refresh credentials for UHC/Humana/WellCare/CarePlus.\n`;
+          out += SUNFIRE_SFP ? `Sunfire: No active plans found.\n` : `Sunfire: Session expired — refresh credentials for UHC/Humana/WellCare/CarePlus.\n`;
         }
         out += '\n';
       }

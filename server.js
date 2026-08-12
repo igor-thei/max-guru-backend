@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { chat } = require('./services/claude');
+const { requireApiKey } = require('./middleware/auth');
 const { loadKnowledge, getKnowledgeSummary } = require('./knowledge/loader');
 const drugLookupRouter = require('./routes/drugLookup');
 const providerLookupRouter = require('./routes/providerLookup');
@@ -19,18 +20,14 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    if (allowedOrigins.includes(origin)) return cb(null, true);
     cb(new Error(`CORS: ${origin} not allowed`));
   },
   credentials: true,
 }));
 app.use(express.json({ limit: '3mb' }));
 
-// Health check
-app.get('/debug-tools', (req, res) => {
-  try {
-    const { TOOLS } = require('./services/claude');
-    res.json({ toolsType: typeof TOOLS, toolsIsArray: Array.isArray(TOOLS), toolsLength: Array.isArray(TOOLS) ? TOOLS.length : null, toolNames: Array.isArray(TOOLS) ? TOOLS.map(t => t.name) : null });
+// debug-tools removed in production
   } catch(e) { res.json({ error: e.message }); }
 });
 
@@ -38,23 +35,25 @@ app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'max-guru', ts: new Date().toISOString() });
 });
 
-// Knowledge index (for debugging)
-app.get('/knowledge', (req, res) => {
+// Knowledge index (admin/debug only)
+app.get('/knowledge', requireApiKey, (req, res) => {
   res.json({ ok: true, summary: getKnowledgeSummary() });
 });
 
 // POST /provider-lookup { doctorName, zip, state? }
-app.use('/drug-search', drugLookupRouter);
-app.use('/provider-lookup', providerLookupRouter);
+app.use('/drug-search', requireApiKey, drugLookupRouter);
+app.use('/provider-lookup', requireApiKey, providerLookupRouter);
 
 // POST /chat { messages: [{role, content}], system?: string }
-app.post('/chat', async (req, res) => {
+app.post('/chat', requireApiKey, async (req, res) => {
   const { messages, system } = req.body;
   if (!Array.isArray(messages) || !messages.length) {
     return res.status(400).json({ error: 'messages array required' });
   }
 
   if (system) {
+    // SECURITY: reject client-controlled system prompts — use server-owned prompt only
+    return res.status(400).json({ error: 'client system prompt not accepted — use /chat without system field' });
     // PASS-THROUGH MODE with tool support
     const { TOOLS, processTool } = require('./services/claude');
     try {
@@ -71,7 +70,7 @@ app.post('/chat', async (req, res) => {
           tools: TOOLS,
         };
         console.log('TOOLS_CHECK', typeof TOOLS, Array.isArray(TOOLS) ? TOOLS.length : 'n/a');
-        console.log('OUTBOUND', JSON.stringify({ ...requestBody, system: '[omitted]' }).slice(0, 1500));
+        console.log('OUTBOUND [redacted for PHI]', JSON.stringify({ model: requestBody.model, max_tokens: requestBody.max_tokens, messageCount: requestBody.messages?.length }).slice(0, 200));
         const anthropicRes = await fetch('https://api.anthropic.com/v1/messages', {
           method: 'POST',
           headers: {

@@ -250,7 +250,7 @@ async function processTool(toolName, toolInput) {
           const sfRes = await fetch(`${SUNFIRE_BASE}/v2/provider/list`, {
             method: 'POST',
             headers: {
-              'Authorization': SUNFIRE_JWT,
+              'Authorization': `Bearer ${SUNFIRE_JWT}`,  // unified Bearer format
               'Content-Type': 'application/json',
               'Cookie': `sfp-cookie=${SUNFIRE_SFP}`,
               'Origin': SUNFIRE_BASE,
@@ -319,7 +319,7 @@ async function processTool(toolName, toolInput) {
     try {
       const prefix = encodeURIComponent(toolInput.name.toLowerCase().slice(0, 20));
       const res = await fetch(`https://www.sunfirematrix.com/v2/drug/search/${prefix}/-1`, {
-        headers: { 'Authorization': process.env.SUNFIRE_JWT || '', 'Accept': 'application/json' },
+        headers: { 'Authorization': `Bearer ${process.env.SUNFIRE_JWT || ''}`,  // unified Bearer format 'Accept': 'application/json' },
         signal: AbortSignal.timeout(10000)
       });
       if (!res.ok) return `Drug search unavailable (${res.status}).`;

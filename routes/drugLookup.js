@@ -23,7 +23,7 @@ router.get('/', async (req, res) => {
   try {
     const response = await fetch(url, {
       headers: {
-        Authorization: SUNFIRE_JWT,
+        Authorization: `Bearer ${SUNFIRE_JWT}`,  // unified Bearer format
         Accept: 'application/json',
         'Content-Type': 'application/json',
       },

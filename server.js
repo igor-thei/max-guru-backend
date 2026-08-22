@@ -27,10 +27,6 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '3mb' }));
 
-// debug-tools removed in production
-  } catch(e) { res.json({ error: e.message }); }
-});
-
 app.get('/health', (req, res) => {
   res.json({ ok: true, service: 'max-guru', authRequired: true, ts: new Date().toISOString() });
 });

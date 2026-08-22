@@ -319,7 +319,7 @@ async function processTool(toolName, toolInput) {
     try {
       const prefix = encodeURIComponent(toolInput.name.toLowerCase().slice(0, 20));
       const res = await fetch(`https://www.sunfirematrix.com/v2/drug/search/${prefix}/-1`, {
-        headers: { 'Authorization': `Bearer ${process.env.SUNFIRE_JWT || ''}`,  // unified Bearer format 'Accept': 'application/json' },
+        headers: { 'Authorization': `Bearer ${process.env.SUNFIRE_JWT || ''}`, 'Accept': 'application/json' }, // unified Bearer format
         signal: AbortSignal.timeout(10000)
       });
       if (!res.ok) return `Drug search unavailable (${res.status}).`;

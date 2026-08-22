@@ -140,7 +140,7 @@ const sendBtn = document.getElementById('send-btn');
 const conversation = [];
 
 // Load knowledge count
-fetch(API + '/knowledge').then(r => r.json()).then(d => {
+fetch(API + '/knowledge', { headers: { 'x-max-api-key': 'ec62c0fc660e3a910c9a3982077f776d24fd6207a48db90599af7dbdb6e2110b' } }).then(r => r.json()).then(d => {
   document.getElementById('plan-count').textContent = 'Knowledge loaded ✓';
 }).catch(() => {
   document.getElementById('plan-count').textContent = '⚠️ Backend offline';
@@ -196,7 +196,7 @@ async function send() {
   try {
     const res = await fetch(API + '/chat', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-max-api-key': 'ec62c0fc660e3a910c9a3982077f776d24fd6207a48db90599af7dbdb6e2110b' },
       body: JSON.stringify({ messages: conversation })
     });
     const data = await res.json();

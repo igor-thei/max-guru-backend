@@ -32,7 +32,7 @@ app.use(express.json({ limit: '3mb' }));
 });
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, service: 'max-guru', ts: new Date().toISOString() });
+  res.json({ ok: true, service: 'max-guru', authRequired: true, ts: new Date().toISOString() });
 });
 
 // Knowledge index (admin/debug only)

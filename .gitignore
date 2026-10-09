@@ -1,3 +1,8 @@
 node_modules/
 .env
 *.log
+__pycache__/
+*.pyc
+data/max-usage.json
+data/max-workups.json
+staging.env

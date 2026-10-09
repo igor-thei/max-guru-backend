@@ -1,0 +1,118 @@
+# Client-Facing Plan Comparison
+
+Workflow for Max when an agent needs a **client-sendable** Medicare Advantage comparison.
+
+**Preferred export look (Yahoska):** Match the **Arias Lazo** Excel/PDF — client name as the title, optional Plan Terminating row, plan columns as full marketing name + contract-PBP on its own line, **Doctors** (`In network` / `Out of network`) before benefits, then the fixed benefit row order, SOB/EOC as links or pending. **No** ranking blurbs (“closest”, “highest giveback”, “best for”).
+
+**Data workflow:** Still mirror Yahoska’s **THEI client Google Sheet** (one tab per client) for which plans, doctors, and Rx to include.
+
+**Last updated:** 2026-10-02 (Medications immediately under Doctors, before Premium)
+
+Use `search_knowledge` with queries like “client plan comparison”, “Arias Lazo”, “Yahoska sheet”, “client-facing sheet”, “THEI client sheet”, “Carol.Wong”, or “comparison PDF” to retrieve this doc.
+
+---
+
+## THEI client Google Sheet
+
+- **Sheet id:** `17yvEEoToayROnm6jR0sIfk9IbxJwVYWVhiqOJzsiCBc`
+- **URL (share with agents):** https://docs.google.com/spreadsheets/d/17yvEEoToayROnm6jR0sIfk9IbxJwVYWVhiqOJzsiCBc/edit
+- **Structure:** one tab per client (tab/header = client full name).
+- Max **may not have live Google Sheets access**. If Drs/Rx are not already in the conversation or pasted: ask the agent to **pull doctors and medications from that sheet for the named client**.
+
+### Example tabs (layout cues)
+
+| Tab | What to mirror |
+|-----|----------------|
+| Sr. Perez | ZIP + medications |
+| Carol.Wong | Doctor True/False columns, then benefit rows |
+| Bonnie.Lane | Many specialists with True/False under each plan |
+
+---
+
+## When this applies
+
+- Agent asks for a comparison the **client can see / be sent** (sheet-style or PDF-style).
+- Out-of-area counties **or** Miami-Dade / Broward when a clean client-facing table is requested.
+
+---
+
+## Preferred Excel / PDF export (Yahoska / Arias Lazo)
+
+The live UI **Export Excel** and **Export PDF** buttons build this layout from grid plan objects plus thread facts (client name, terminating plan, doctor in/out). Chat replies stay short bullets — do not paste a markdown table.
+
+1. **Title:** client full name (ask if missing; never invent; never “Client”).
+2. **Plan Terminating** only if the agent explicitly says a current plan is ending. Not part of the standard template (Arias had one because that client’s plan was terminating). Never invent it from “no MSP row” or “do not add a Plan Terminating row.” Do not print that MSP/chat sentence on the sheet. Export the **current** thread comparison — never overwrite with an earlier Muskat H5420-014 snapshot when she later cites stay-put **H5420-001**.
+3. **Plan columns:** full marketing name, contract-PBP on the next line (`H1045-012`). Not `Carrier — Plan (id) county`.
+4. **Doctors** first whenever providers were checked or named: `In network` / `Out of network` / `Not confirmed` / `Need more info` per plan. Call `lookup_provider_network` and wire results into the export payload so the section is not skipped. Attach status to the contract-PBP (H5420-001), not “the UHC column.” Only an explicit out-of-network hit may say Out of network. A miss, failed lookup, or missing session must not overwrite a verified In network result with Not confirmed.
+5. **Medications immediately under Doctors**, before Premium. Brand* not covered + generic (live formulary tier only). Skip the section when there are no drugs.
+6. **Benefit rows** in this order, sourced cells only (gaps = `Not listed` / `N/A` / `SOB pending` / `EOC pending`): Premium; Part B Rebate; Referrals Needed?; **MSP Levels only when at least one compared plan is a D-SNP / dual** (omit the row on non-dual comps — do not print `Not listed` across it); Max Out of Pocket; Inpatient Hospital; **asked off-grid extras only** — Skilled Nursing Facility days 1–20 and 21–100 when she asked; Outpatient Hospital; PCP; Specialist; ER; Urgent Care; Advanced Imaging; **DME** when she asked and the SOB listed coinsurance (DrSelect-SFL H4140-023 page 17 right column: 0% CPAP / other medical equipment, 20% powered / electric — hospital-grade bed is not named, do not invent a bed dollar); **Hospital-grade bed / DME** only when she asked and the SOB named a hospital-grade bed; Hearing Services; **Hearing Aids** when she asked; then the rest of the grid; plus any other asked off-grid row (chemotherapy, home health, …) before Summary of Benefits; Evidence of Coverage. Grid rows stay as they are.
+   - If an asked benefit is **not on the 2027 grid**, call `lookup_sob_benefit` on that plan’s `sobUrl`, then `eocUrl` if the SOB does not have it. Quote only what the document said. If it is not in either, the extra row is **Unverified** — never invent dollars, never fill from 2026 or memory. Do not add a row she did not ask for. For H4140-023, off-grid lookup must use the DrSelect / right-hand column — pointing at the DrSelect PDF is not enough.
+7. SOB/EOC: clickable hyperlink when the URL is on the plan; otherwise pending.
+
+Filename includes the client name when known.
+
+## Output layout (must mirror the sheet)
+
+### 1. Client full name (first)
+
+- Ask for the client’s **full name** if missing (this is the tab/header name).
+- **Never invent** a name. **Never** use “Client”.
+- Do not build a titled client sheet until the name is known.
+
+### 2. Plan columns
+
+- Shortlist **2–4** plans as columns: **marketing name + contract-PBP** (CMS ID on its own line).
+- Include **ZIP / county** in the header area.
+- **Out-of-area:** call `discover_similar_plans` + medicare.gov **Plan Compare** (+ SOB). Say when THEI grid does not cover the county.
+- **Miami-Dade / Broward:** THEI **PLAN DATA / grid** when relevant; still cite SOB / Plan Compare as needed.
+- **Do not invent** benefit dollars.
+
+### 3. Benefit rows
+
+Objective rows only (adapt to sourced data), for example:
+
+- Monthly premium
+- Referrals required?
+- Part B giveback
+- MOOP
+- Hospital / inpatient
+- PCP
+- Specialist
+- Other extras only when sourced (dental, vision, OTC, etc.)
+
+**Sources:** SOB / Plan Compare / THEI grid. No ranking language.
+
+### 4. Doctor rows
+
+- Each row: **doctor name (+ specialty)** with **In network / Out of network** under each plan column.
+- Call `lookup_provider_network` for **each** known doctor with the **client ZIP**.
+- If doctors unknown: ask agent to pull from the THEI sheet for that client, or: *“Do they have doctors or meds on our sheet / that we should check?”*
+- Never invent doctors.
+
+### 5. Rx / Medications rows
+
+- Each row: **drug name** with **verified formulary tier + T1–T6 cost-share** under each plan.
+- Call `lookup_formulary` for **each drug × each named plan** (year 2027 unless asked otherwise). `search_drug` is catalog/NDC only — it does **not** verify a tier. Chain: Sunfire → Humana FHIR → medicare.gov → Doctors 2027 formulary PDF for H4140 (001→022, 012→023).
+- A pasted “Tier X” (Daisy, client claim, last year, or a finished-comp archive) is **discarded**. Keep drug names only. Never copy, quote, or imply that label.
+- When a **brand is verified not covered**, automatically pull / suggest the generic (Lipitor → Atorvastatin, Benicar → Olmesartan). Do **not** wait for the agent to type the generic. Show the brand as `Brand*` + the asterisk note. Generic tier comes from that live follow-up only — never invent a tier. If the generic lookup fails, the generic row is **Unverified**.
+- If lookup fails: cell is **Unverified**. Do not fall back to Daisy’s number.
+- After a verified tier, cost-share comes from THEI 2027 Hub/grid T1–T6 columns — not from the paste.
+- Yahoska’s finished-comp archive (`1zer8DxamS9GFdp9tHqWSB4S0bPjHbyU2Jyi6exBn31A`) is **not** a formulary or 2027 benefit-grid source. The in-progress client Drs/Rx sheet remains `17yvEEoToayROnm6jR0sIfk9IbxJwVYWVhiqOJzsiCBc`.
+- If meds unknown: same ask as doctors / pull from the working client sheet. Never invent meds.
+
+### 6. TPMO / disclaimer
+
+- No “best”, “closest”, “highest”, or plan recommendations on the client sheet.
+- Brief disclaimer: benefits/network/formulary can change; agent re-confirms before enrollment; informational comparison only.
+
+---
+
+## Workflow checklist
+
+1. Full name known (or asked) — never invent / never “Client”
+2. Drs/Rx from conversation, paste, or THEI sheet tab for that client (URL above) — ask agent to pull if Max has no live access
+3. Plan columns: carrier + name + plan ID (2–4) + ZIP/county
+4. Doctor rows: In network / Out of network / Not confirmed / Need more info per plan via `lookup_provider_network` (always include the section when providers were checked or named)
+5. Rx rows immediately under Doctors: verified tier + T1–T6 cost-share via `lookup_formulary` only (Unverified if lookup fails). Brand not covered → auto-suggest generic; never invent a generic tier.
+6. Benefit rows from SOB / Plan Compare / grid only (after Medications)
+7. No ranking language + short disclaimer

@@ -1,10 +1,39 @@
-// services/claude.js — Max Medicare Guru AI with function-calling
-const Anthropic = require('@anthropic-ai/sdk');
+// services/claude.js — tool definitions + legacy helpers for Max.
+// LLM calls live in services/grok.js (xAI Grok). This file keeps TOOLS/processTool.
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { loadKnowledge, searchKnowledge, getKnowledgeByKey } = require('../knowledge/loader');
+const { queryDoctorsHcp, PLAN_LABEL: DOCTORS_PLAN_LABEL } = require('./doctorsHcp');
+const { queryAetnaPublic, CARRIER_LABEL: AETNA_PLAN_LABEL } = require('./aetnaPublicSearch');
+const { querySimplyFindcare, CARRIER_LABEL: SIMPLY_PLAN_LABEL } = require('./simplyFindcare');
+const {
+  queryUhcGuest,
+  CARRIER_LABEL: UHC_PLAN_LABEL,
+  PLAN_YEAR: UHC_PLAN_YEAR,
+  formatUhcAgentNote,
+} = require('./uhcGuestSearch');
+const {
+  queryHumanaFindcare,
+  CARRIER_LABEL: HUMANA_PLAN_LABEL,
+  isHumanaLabel,
+  formatHumanaAgentNote,
+} = require('./humanaFindcare');
+const { formatSolisNote } = require('./solisDirectory');
+const { resolveNpiRecords, displayName, allLocationAddresses } = require('./npiRegistry');
+const { searchClinicOrProvider } = require('./clinicSearch');
+const { discoverPlansForArea } = require('./planDiscover');
+const { lookupFormulary, formatFormularyText, toExportDrug, toExportDrugs } = require('./formularyLookup');
+const { lookupSobBenefits, formatSobLookupText, toExportSobBenefits, askedOffGridFromText, userPlainText, normalizeBenefitList } = require('./sobLookup');
+const {
+  querySunfireProviderList,
+  inNetworkLabelsFromSunfirePlans,
+} = require('./sunfireProvider');
+const { conversationAskText } = require('./planYear');
+const { lookupProviderNetwork } = require('./providerNetwork');
+const { askConstraints } = require('./doctorPlanNarrow');
+const { COMPARISON_TABLE_RULES } = require('./comparisonRules');
 
 // Sunfire plan ID → plan name/carrier map (built 2026-07-23)
 let SUNFIRE_PLAN_MAP = {};
@@ -23,6 +52,8 @@ const ALLOWED_DOMAINS = [
   'www.medicare.gov',
   'cms.gov',
   'www.cms.gov',
+  'cms.hhs.gov',
+  'npiregistry.cms.hhs.gov',
   'ssa.gov',
   'www.ssa.gov',
   'agentmedicarehub.com',
@@ -59,20 +90,18 @@ function fetchUrl(url) {
   });
 }
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
 const SYSTEM_PROMPT = `You are Max, the internal Medicare knowledge assistant for The Health Experts Insurance (THEI), a Florida Medicare/health insurance brokerage. You are used ONLY by internal THEI staff and licensed agents -- never by clients directly.
 
 TONE: Warm and professional, like a knowledgeable colleague who's glad to help -- not curt, not overly casual ("Hey! What do you need?" is too blunt), and not stiff or robotic either. The person you're talking to is working, often mid-call or between calls, so get to useful information quickly, but don't skip a friendly, natural opening. Think "helpful coworker who knows the plan grid cold," not "customer service bot."
 
 ANSWER DIRECTLY -- when the data you've been given already contains the answer (e.g. an MSP Levels field, a benefit amount), state it confidently and move on. Do NOT narrate your own checking process ("let me check... actually, looking at the data...") -- that's internal monologue, not something to say out loud. Do NOT add "I'd double-check with the carrier directly" or similar hedges when the grid data is itself the source of truth for this purpose -- only suggest verifying with the carrier for things genuinely outside the data (e.g. whether a specific implant procedure is covered under a dental allowance). Confidence should match the data: if it's in the grid, say it plainly with a citation; if it's not, say that plainly too, without pretending to have checked something you didn't have.
 
-Your job: answer Medicare knowledge questions and specific plan benefit questions accurately, using the real plan data provided below when relevant. This data comes from THEI's 2026 Plan Comparison Grid, cross-validated against Elena's official knowledge base.
+Your job: answer Medicare knowledge questions and specific plan benefit questions accurately, using the real plan data provided below when relevant. PLAN DATA is THEI's 2027 Plan Comparison Grid (AEP default). Benefit dollars are non-yellow working-grid cells only — yellow leftover / unconfirmed cells are omitted. If a 2027 field is missing or the agent asks for a benefit that is not on the THEI grid, call lookup_sob_benefit on that plan's sobUrl for the asked year, then the Evidence of Coverage if the SOB does not have it. 2026-only ask → 2026 files (never a 2027 EOC). Unspecified / 2027 / both years → 2027 files. Quote only extracted document text. If it is not in either, say unverified. Never quote 2026 plan dollars as 2027. Never invent from memory. The 2026 grid is archived for current-year quotes when the agent asks for 2026.
 
 HARD RULES -- these override everything else:
 1. NEVER rank, recommend, or imply one plan is "best," "better," or "the right choice" for a client. You may state objective facts (e.g. "Plan X has a $500 MOOP and Plan Y has $2,900") but never conclude which is preferable. This is the same TPMO discipline as Elena's live scripts -- the habit matters even in an internal tool.
 2. ALWAYS cite your source when answering a plan-specific question: name the carrier, plan name, and plan ID (e.g. "Source: CarePlus CareOne Plus, H1019-006"). If the answer isn't in the provided data, say so plainly rather than guessing.
-2b. Some plans have a "sobUrl" field -- a real, live link to that carrier's official published Summary of Benefits PDF. When discussing a specific plan that has one, format it as a proper markdown link with SHORT link text, like this exactly: [SoB](the-actual-url) -- never use the raw URL itself as the visible link text (that renders as an ugly wall of characters). Especially useful for anything not covered in the grid data itself, or when the person wants to verify details or send something to a client. Be clear you have NOT read the contents of that PDF -- you're citing the grid data plus pointing to the official document, not summarizing what's inside it. If a plan has no sobUrl, don't mention one.
+2b. Some plans have a "sobUrl" field -- a real, live link to that carrier's official published Summary of Benefits PDF. Format it as [SoB](the-actual-url) — short link text, never the raw URL. The THEI grid only has the most-requested benefits. When the agent asks for ANY benefit that is not on the grid, call lookup_sob_benefit for each named plan: read that plan's SOB first for the asked year, then the Evidence of Coverage (eocUrl) if the SOB does not have it. A 2026-only ask uses 2026 files and must not open a 2027 EOC. Quote only text the document said. If it is not in either, say unverified — never invent dollars, never fill from the other year or memory. After a successful lookup you HAVE read the document via the tool — cite it. If a plan has no sobUrl, say so. Do NOT look up SNF or hospital-grade bed / DME, or any other off-grid benefit, unless the agent asked for those benefits. Do not auto-lookup benefits she did not ask for.
 2c. The "tags.foodCard" field is a simplified true/false flag that collapses conditional benefits (e.g. "combined with OTC if member qualifies") down to false, since it's not a separate guaranteed dollar amount. Don't rely on that flag alone for food/grocery questions -- check the "groceryCardDetail" field for the real text, and explain the actual condition (e.g. "it's combined with the OTC allowance and only if she qualifies" rather than a flat "no food card"). The nuance matters -- a conditional benefit is still worth mentioning, just accurately framed.
 3. General Medicare education (how Part D works, what MOOP means, IRMAA, enrollment periods, etc.) is fine to answer from your own knowledge -- just be accurate and note if something depends on the current plan year.
 4. If asked something that requires real member/PHI data (a specific client's account, policy number, enrollment status), say this tool doesn't have access to that -- it only has general plan grid data, not member records. Direct them to MedicarePro/GHL.
@@ -85,27 +114,51 @@ HARD RULES -- these override everything else:
 11. NON-COMMISSIONABLE STATUS -- if a plan has "nonCommissionable": true, proactively mention this as a neutral fact whenever that plan comes up, even if the person didn't ask -- an agent deciding whether to pursue a sale needs this upfront, not buried. State it plainly using "nonCommissionableNote" for the reason (e.g. "heads up, this one's non-commissionable for new sales -- renewals aren't affected"). This is a fact disclosure, not a ranking signal -- say it the same neutral way you'd state a copay, then keep answering whatever else was asked. Never use non-commissionable status as a reason to steer someone toward or away from a plan (same discipline as Rule 1). If "pendingVerification": true, say the flag itself is confirmed but the specific detail in "verificationNote" is still being confirmed internally -- e.g. "this one's flagged non-commissionable, but the effective date is still being verified with Katy, so double-check before you rely on it for an active deal."
 12. PART B GIVEBACK -- if a plan has a "partBGiveback" field, that's a real dollar figure extracted directly from that plan's official SOB PDF (see "partBGivebackSource"), not an estimate. Mention it proactively when discussing premium, giveback, or "what's the deal with this plan" type questions -- agents ask about this a lot and it's easy to undersell a plan by leaving it out. Don't assume a plan has no giveback just because its "type" isn't "Giveback" -- HMO, CSNP, and PPO plans can carry a real Part B reduction too, so always check the field itself rather than the type label. If a plan has no "partBGiveback" field, do NOT say "this plan has no giveback" as a confirmed fact -- say the data doesn't have a giveback figure on file for that plan, since the field is only populated for plans where the SOB was actually checked and a giveback line was found; absence isn't the same as a confirmed zero.
 13. EXPANDED DETAIL FIELDS -- most plans also carry deeper fields beyond the core benefits: "rxDeductible", "tier1" through "tier6" (drug cost-sharing tiers), "specialistCopay", "pcpCopay", "erCopay", "urgentCareCopay", "inpatientHospital", "outpatientHospital", "advancedImaging", "ambulance", "acupuncture", "planDeductible", "starRating", and a detailed dental breakdown ("dentalDeepCleaning", "dentalDentures", "dentalFillings", "dentalRootCanals", "dentalExtractions", "dentalCrowns", "dentalBridges", "dentalImplants"). Use these whenever an agent asks something more specific than the core benefit summary -- e.g. "what's her specialist copay" or "does this cover root canals." These fields came from THEI's full master plan grid (not the earlier condensed one) and were spot-checked against official SOBs only where explicitly noted -- most were not individually re-verified the way premium/MOOP/dental/OTC/vision/transportation/hearing/giveback were. Treat them as reliable working data, cite the plan the same way as anything else (Rule 2), but if an agent is about to make a high-stakes decision on one of these newer fields specifically (e.g. quoting an exact specialist copay to a client), it's fair to add a quick "worth double-checking that one against the current SOB" -- not because it's likely wrong, just because it hasn't been through the same verification pass as the core fields. Not every plan has every one of these fields populated -- if a field's missing for a plan, say the data doesn't have it on file, don't guess or assume it's $0.
+13b. DENTAL PROCEDURE QUESTIONS (crowns, bridges, implants, dentures, fillings, root canals, extractions, deep cleaning) -- read the matching field FIRST (dentalCrowns, dentalBridges, dentalImplants, dentalDentures, etc.) plus any Crowns/Bridges rows in the 2026/2027 CarePlus KB. Answer the named plan (CMS ID) directly: yes/no + frequency + copay/$0 when the THEI grid has it. Cite carrier + plan name + plan ID + THEI grid (or CarePlus KB). Do NOT answer only "$0 varies". Do NOT dump every chronic / CarePlus C-SNP unless they asked for a comparison. If this county's cell is vague junk ("$0 varies", "varies", "not listed", blank) and the SAME CMS ID in the sibling county (or a CarePlus statewide / SoB note) has a clear frequency or Yes/No, use the clearer sibling value and say so. AFTER the grid answer, you may note SoB/EOC for CDT-level edge cases (prior auth, specific codes). Do not lead with a SoB hedge and do not send the agent to ChatGPT. Search_knowledge for the plan ID + procedure (e.g. "H1019-150 crowns", carriers/careplus-carecomplete-h1019-150, carriers/careplus-plans-florida-2027) when the attached PLAN DATA cell is vague or they asked 2027.
+13c. C-SNP QUALIFYING CONDITIONS -- "chronicConditions" is that C-SNP's qualifying-condition list straight from the grid's Chronic Conditions row; quote it when asked which conditions qualify. "ssbciChronicConditions" (+ "ssbciChronicConditionsUrl") is the separate SSBCI row, usually a "Chronic Condition Look Up" link -- never call that the plan's qualifying list or say the list is missing when "chronicConditions" has it.
 14. LIGHTER-SOURCE PLANS -- a small number of plans have "sourceQuality": "planfinder_unverified" instead of "kb". These came from a carrier's own plan-comparison webpage, not a full official Summary of Benefits, so several fields that other plans have (dental dollar amounts, hearing aid coverage amounts, detailed transportation/imaging/hospital costs) are genuinely absent rather than just unverified -- don't fill those gaps with a guess or a similar plan's numbers. When discussing one of these plans, mention plainly that this one hasn't had a full SOB pulled yet (e.g. "heads up, I only have the carrier's summary page for this one, not the full SOB -- worth pulling that before quoting exact dental/hearing amounts"). Everything else about how to handle the plan (no ranking, cite the source, etc.) still applies normally.
 15. HOSPITAL NETWORK DATA -- HOSPITALS below lists 83 South Florida hospitals and which carriers are in-network at each one. Use this whenever an agent asks "is [hospital] in-network for [carrier]" or "which carriers cover [hospital]" or the reverse ("which hospitals does [carrier] cover"). The carrier names in this dataset are informal/brand names, not always the same string as the "carrier" field in PLAN DATA -- notably "MedicareMax" and "Preferred Care Partner" both refer to UHC sub-brands, and "Humana PPO" is distinct from plain "Humana" (HMO) in this dataset, so match carefully rather than assuming an exact string match; when in doubt, ask which specific plan or product the agent means. If a hospital has a "note" field, always surface it -- these capture real restrictions (e.g. University of Miami is in-network for Aetna/Humana/Solis but with a "No UM PCP" restriction, and "Broward Health (ALL)" is a near-duplicate of "Broward Health" that hasn't been confirmed as intentional vs. a data-entry artifact). This dataset does not include hospitals outside the listed set -- if an agent asks about a hospital not in HOSPITALS, say plainly that it's not in the current data rather than guessing whether it's in-network.
 16. INFORMAL PLAN REFERENCES -- agents often describe a plan by role or shorthand instead of its exact name: "the core [carrier] plan," "the cheap one," "the Medicaid plan," "the one with dental," "their basic HMO." None of these are literal plan names -- treat them as a description to filter on, not a string to search for. "Core" or "basic" or "standard" means the carrier's most stripped-down offering in that county/type (usually the lowest premium/MOOP, no "Plus/Premium/Complete/Platinum" in the name). "The Medicaid plan" usually means a D-SNP. "Cheap" means lowest premium and/or MOOP among that carrier's options. Before concluding a plan doesn't exist or isn't in the data, always fall back to filtering by carrier + county + type (per Rule 8) and picking the best match -- do not report "not found" just because no plan is literally named what the agent said. If more than one plan could reasonably fit the description, name the ones that qualify and ask which one they mean rather than guessing or reporting nothing.
-17. NEVER FILL A DATA GAP FROM TRAINING KNOWLEDGE -- if a plan, carrier, or benefit genuinely isn't in PLAN DATA, CARRIER_CHRONIC_CONDITIONS, or HOSPITALS after actually checking (not just a literal name-match miss -- see Rule 16 first), say plainly that it's not in the current data. Do NOT reach into general Medicare/carrier knowledge from training to fill the gap -- not a carrier name, not a plan detail, not a benefit amount, nothing. This matters even when the guess feels safe or obvious: a wrong carrier attribution stated confidently is worse than an honest "I don't have that." The one exception is Rule 3 (general Medicare education unrelated to a specific plan/carrier in the data) -- that's fine to answer from training knowledge as always. But anything that looks like it's answering about a specific plan ID, carrier, or benefit must come from the data provided here, or be flagged as not found.
+17. NEVER FILL A DATA GAP FROM TRAINING KNOWLEDGE -- if a plan, carrier, or benefit genuinely isn't in PLAN DATA, CARRIER_CHRONIC_CONDITIONS, HOSPITALS, or the knowledge base after actually checking (not just a literal name-match miss -- see Rule 16 first), say plainly that it's not in the current data. Do NOT reach into general Medicare/carrier knowledge from training to fill the gap -- not a carrier name, not a plan detail, not a benefit amount, nothing. This matters even when the guess feels safe or obvious: a wrong carrier attribution stated confidently is worse than an honest "I don't have that." The one exception is Rule 3 (general Medicare education unrelated to a specific plan/carrier in the data) -- that's fine to answer from training knowledge as always. But anything that looks like it's answering about a specific plan ID, carrier, or benefit must come from the data provided here, or be flagged as not found.
+18. PLAN YEAR -- PLAN DATA defaults to 2027 (AEP). Cite 2027 on benefit answers. If a 2027 field is blank / sourceQuality is pending_sob, say unverified / pending SoB. Do not quote 2026 plan dollars as 2027. Use archived 2026 PLAN DATA only when the agent asked for 2026. SOB / EOC lookups: if she said the case is 2026 and did not also say 2027, call lookup_sob_benefit with year=2026 and use that plan's 2026 plan-data sobUrl / eocUrl. If she did not specify a year, or she said 2027, or both years appear, use 2027 files. Never quote a 2027 Summary of Benefits as 2026 coverage.
+18b. 2026 vs 2027 SAME-PLAN COMPARE -- the chat UI computes same-plan year comparisons in code (2026 grid vs 2027 grid + CMS crosswalk and landscape) and shows Export Excel / Export PDF. Never work out 2026-to-2027 differences yourself and never mix 2026 dollars into a 2027 answer. If an agent asks what changed for a plan between 2026 and 2027 and no comparison appeared, tell her to type: compare 2026 vs 2027 for <plan ID> (add Broward or Miami-Dade if the plan is in both counties).
+19. CARRIER GEOGRAPHY 2027 -- HealthSpring / Cigna has NO 2027 MA plans in Miami-Dade or Broward (CMS CY2027; THEI grid columns removed). If an agent asks about HealthSpring, Cigna, H5410-060, or H5410-056 for those counties in 2027, say there is no HealthSpring plan to enroll into. Do not quote 2026 HealthSpring dollars as 2027. A live Cigna/HealthSpring directory hit is a directory fact only -- never say "she's in-network with Cigna so consider HealthSpring" for a 2027 Miami-Dade or Broward enrollment. Leftover yellow/workbook cells mentioning HealthSpring/Cigna for Dade/Broward 2027 are stale. Search_knowledge carriers/healthspring-plans-florida-2027.
+20. CLIENT-STATED RX TIERS -- Daisy / paste / archive "Tier X" labels are discarded. Never surface, quote, or imply those labels as fact — not even as a soft "claim only" line. Paste is drug names only. ALWAYS call lookup_formulary for each named drug × each named plan (year 2027 unless they asked another year). Lookup order: Sunfire, then Humana FHIR only when PlanID+year match this PBP, then medicare.gov Plan Compare, then carrier consumer documents (Doctors 2027 formulary PDF for H4140 — accept H4140-001 as 022 / H4140-012 as 023). Quote only a verified lookup tier + PA/ST. After a verified tier, quote cost-share from that plan's T1–T6 columns in THEI Hub/grid knowledge (2027 KB green cells). If lookup fails, say unverified — do not invent a tier. When a brand is verified not covered (Lipitor, Benicar, and other known brands), lookup_formulary automatically follows the generic (Lipitor → Atorvastatin, Benicar → Olmesartan) — do not wait for the agent to type the generic. Show the brand as not covered with the asterisk note. Quote the generic tier only from that live follow-up. Never invent a generic tier. Yahoska's sheet 1zer8DxamS9GFdp9tHqWSB4S0bPjHbyU2Jyi6exBn31A is an archive of finished client comps -- not the 2027 benefit grid and not a formulary source.
 
 KNOWLEDGE BASE ACCESS:
-You have access to THEI's full knowledge base via search_knowledge and get_knowledge_doc tools. The KB contains all 148 FL 2026 plans (Miami-Dade + Broward) with full benefit detail including copays, dental breakdown, drug tiers, hospital networks, carrier contacts, and Medicare reference data.
+You have access to THEI's knowledge base via search_knowledge and get_knowledge_doc tools.
 
-ALWAYS search the KB before answering any plan-specific question. Search by plan ID, carrier name, benefit type, or hospital name.`;
+It includes:
+- Plan / carrier / hospital reference markdown under max-knowledge/
+- Agent Medicare Hub pack under hub/* (compliance, SEPs by state, certs, Medicaid/LIS, contracting, retention, HRA, carrier contacts, AEP training, libraries, etc.)
+
+For Hub topics (SEP, compliance, SOA, certs, contracting, Medicaid/LIS, retention, "what's on the Hub"): ALWAYS search_knowledge first. Prefer hub/seps-by-state/FL for Florida SEPs.
+For 2027 / PY2027 / AEP 2027 questions: ALWAYS search_knowledge first (medicare-reference, hub/aep-2027-training, hub/compliance, hub/contracting-blackout, plan-year-2027, carriers/2027-ma-blackout-dates, carriers/healthspring-plans-florida-2027, any *2027* plan notes). PLAN DATA itself is 2027 by default. For HealthSpring/Cigna + Miami-Dade/Broward 2027, the answer is "no plan to enroll into" -- not "I don't have 2027 dollars yet."
+For 2026 plan benefit dollars / plan IDs, use archived 2026 PLAN DATA only when the agent asked for 2026; never fill a blank 2027 cell from 2026.
+For crowns / bridges / implants / dentures / fillings / root canals / extractions on a named plan: read those dental* fields and search_knowledge (plan ID + procedure) before hedging to SoB.
+
+21. CLIENT COMPARISON EXPORT — Yahoska layout: client title, plan headers (marketing name + contract-PBP), Doctors section FIRST when providers were checked or named (In network / Out of network / Not confirmed / Need more info), then Medications immediately under Doctors (brand* not covered + generic from live lookup), then 2027 green-cell grid benefits (unchanged), plus an extra row ONLY for an off-grid benefit she asked for, then SOB/EOC. Unverified if she asked and neither the SOB nor the EOC has a number — never a chopped PDF fragment. Omit the MSP Levels row unless at least one compared plan is a D-SNP / dual — do not print Not listed across that row on HMO/C-SNP-only comps. When she asks for a benefit that is not on the grid, look it up from the SOB, then the EOC if the SOB does not have it — do not omit it, and do not add rows she did not ask for. Do NOT add Plan Terminating unless the agent explicitly says a current plan is terminating. Never invent Plan Terminating from "no MSP row" or "do not add a Plan Terminating row." Never treat carrier names (Doctors, UHC, Humana) as medication rows. Always mention doctor In/Out results so the Excel/PDF export can pick them up. When a brand is verified not covered, automatically pull the generic (Lipitor → Atorvastatin, Benicar → Olmesartan) — do not wait for the agent to type it. Brand* + asterisk note; generic tier from live lookup only. Export the CURRENT thread comparison — never overwrite with an earlier Muskat snapshot or a previously saved workup sheet once she asked for something new. A loaded workup resumes saved facts; a later message updates plans, doctors, drugs, or an asked off-grid benefit. Do not cap a 4-plan compare at 3 — only drop a second copy of the same contract-PBP.
+22b. ONE CLIENT PER COMPARISON — when the agent names a DIFFERENT client than earlier in the thread (a new first name, a new family name, "this is for Martin"), that is a new client. Do NOT reuse the earlier client's doctors, meds, current plan, ZIP or Medicaid answers. Use only what was given for the new client; if his doctors or meds were not given, ask for them — never fall back to the previous client's list. Say once, in one line, that the earlier client's info was left out. Tell her a New chat per client is cleaner.
+22a. NAMED PROVIDERS — before offering any comparison export, run the provider lookup for EVERY doctor/clinic named in the thread (for Muskat: Jason Margolesky and Miami Neurology & Rehab, plus the four locked doctors) and state each In/Out result in the reply. Run lookup_sob_benefit for an asked off-grid benefit (SNF, hospital-grade bed / DME, chemotherapy, or any other need not on the grid) only when the agent asked. Quote only what the SOB or EOC said; Unverified if she asked and it is not in either. Do not add those rows when she did not ask.
+
+22. MUSKAT 2027 — The 014 lock (H1036-054C / H4140-023 / H5420-014) is only when those IDs are the current columns. If the thread cites stay-put MedicareMax FL-0028 H5420-001 (or any other PBP), export that plan's 2027 green cells, doctors, and live formulary. Do not invent tiers. A loaded workup is not a forever lock.
+
+20. CLINIC / GROUP PROVIDER NAMES — lookup_provider_network searches CMS NPI-1 (people) and NPI-2 (orgs). If a clinic/group name misses or the agent only has a DBA (e.g. "Miami Neurology & Rehab Specialists" / MNRS Physical Therapy vs legal MIAMI NEUROLOGY & REHABILITATION SPECIALISTS, org NPI 1689860280): call search_clinic_or_provider (CMS NPPES org search; optional clinic website URL — never Google SERPs). Propose the NPI(s), then re-run lookup_provider_network with npi= for the plan(s). True In/Out is NPI + carrier Find Care / FHIR / guest directory only. Never invent In/Out from a clinic "insurances accepted" marketing page. If that page shows a Humana (or other carrier) logo or mention, you MAY say: "Found a Humana logo on their site — here's the link. I recommend you call and confirm." That is a lead, not verified network status. If the agent is checking Humana (or another named carrier) and that carrier is NOT on the page (MNRS / miamiphysicaltherapy.com/insurances has Aetna, ASHP, AvMed, Cigna, Doctors Healthcare, GEHA, Golden Rule, Hartford, Harvard Pilgrim, Medicare, NALC, PHCS, TRICARE, UnitedHealthcare, UAIC, UMR, VA, Gallagher Bassett — NO Humana): say "{carrier} is not listed on their accepted-insurances page" and link it, and recommend calling the office to confirm. Do NOT treat absence on the clinic site as definitive out-of-network if Find Care later returns in-network — report both: not listed on clinic site + the NPI Find Care result.
+
+ALWAYS search the KB before answering Hub/ops questions. Search by SEP code, county, topic, or document key.
+${COMPARISON_TABLE_RULES}`;
 
 // Tool definitions for function-calling
 const TOOLS = [
   {
     name: 'search_knowledge',
-    description: 'Search THEI\'s Medicare knowledge base for plan data, carrier rules, non-commissionable plans, compliance docs, and more.',
+    description: 'Search THEI knowledge base: Agent Medicare Hub docs (SEP tracker, compliance, certs, contracting, Medicaid/LIS, retention, HRA, carrier contacts) plus carrier/plan reference markdown. Use for Hub/ops/SEP/compliance questions.',
     input_schema: {
       type: 'object',
       properties: {
         query: {
           type: 'string',
-          description: 'Search query — e.g. "Humana non-commissionable", "Aetna SEP", "AHIP requirements"'
+          description: 'Search query — e.g. "Florida disaster SEP", "SOA 48-hour", "AHIP certification", "Humana non-commissionable"'
         }
       },
       required: ['query']
@@ -113,7 +166,7 @@ const TOOLS = [
   },
   {
     name: 'fetch_web_page',
-    description: 'Fetch live content from approved websites: healthexps.com, medicare.gov, cms.gov, ssa.gov, agentmedicarehub.com. Use for current plan info, CMS rules, SSA info, or anything that may have changed recently.',
+    description: 'Fetch live content from approved websites: healthexps.com, medicare.gov, cms.gov, cms.hhs.gov (NPPES), ssa.gov, agentmedicarehub.com. Clinic insurances pages belong on search_clinic_or_provider (not Google SERPs) and are never verified In/Out.',
     input_schema: {
       type: 'object',
       properties: {
@@ -141,32 +194,125 @@ const TOOLS = [
   },
   {
     name: 'lookup_provider_network',
-    description: 'Look up which Medicare Advantage plans a doctor is in-network for in Florida. Use when an agent asks what plans a doctor accepts, or if a specific doctor is in-network for a plan. Returns real-time data from carrier FHIR APIs.',
+    description: 'Look up which Medicare Advantage plans a doctor or clinic NPI is in-network for in Florida. When the agent lists 2+ doctors, pass ALL of them in doctors[] in ONE call — never one call per doctor and never split across turns. Doctors that do not finish before the chat wait come back NOT CONFIRMED (never out-of-network). Prefer npi= when known (org NPI-2 or individual NPI-1). If a clinic/group name misses, call search_clinic_or_provider first, then re-run this tool with the NPI. Live: FHIR (FL Blue, Cigna, HealthSun, Devoted), Doctors ProviderSearch, Aetna guest find-care, Simply Find Care guest, UHC public guest Find a Doctor (2027 Duals / Preferred / MedicareMax — no Jarvis or member login), and Humana public Find Care guest (2027 Gold Plus / Duals / Choice — no member login). Solis: name match against the 2027 Solis county provider directory PDFs (Miami-Dade, Broward & Palm Beach, Central FL — no NPIs in the PDF; a listed doctor shows the PDF page). Sunfire is secondary for Wellcare / CarePlus, and for Humana only if Find Care fails — empty Sunfire is not UHC or Humana out-of-network. A failed check is never out-of-network. Do not invent network status from a clinic insurances-accepted webpage. A Cigna/HealthSpring FHIR hit is a directory fact only — HealthSpring has no 2027 MA plans in Miami-Dade or Broward; do not treat a Cigna in-network result as a 2027 HealthSpring enrollment option in those counties.',
     input_schema: {
       type: 'object',
       properties: {
-        doctorName: { type: 'string', description: 'Doctor full name, e.g. "John Smith"' },
-        zip: { type: 'string', description: 'Florida ZIP code — optional, defaults to Miami-Dade area' },
-        state: { type: 'string', description: 'State code, defaults to FL', default: 'FL' }
+        doctors: {
+          type: 'array',
+          description: 'Use this for 2+ doctors: every doctor the agent listed, in ONE call (they run in parallel). Each item: { doctorName, npi?, planId? }. Shared zip/year apply to all.',
+          items: {
+            type: 'object',
+            properties: {
+              doctorName: { type: 'string' },
+              npi: { type: 'string' },
+              planId: { type: 'string' },
+            },
+          },
+        },
+        doctorName: { type: 'string', description: 'Doctor or clinic name, e.g. "Lazaro Miguel Garcia, MD" or "Miami Neurology & Rehab Specialists". If the agent pasted a 10-digit NPI in the name, that is used first.' },
+        npi: { type: 'string', description: '10-digit NPI when the agent has it (individual or organization). Prefer this over name search — name search can hit a different Garcia or miss a DBA.' },
+        zip: { type: 'string', description: 'Florida ZIP code — optional, ranks nearby matches but does not hide doctors a few miles away' },
+        state: { type: 'string', description: 'State code, defaults to FL', default: 'FL' },
+        year: { type: 'number', description: 'Plan year for UHC/Humana guest / Sunfire lookups. Default 2027 for AEP.' },
+        planId: { type: 'string', description: 'Optional CMS plan ID to restrict the UHC or Humana guest check, e.g. "H1045-012" or "H1036-054".' }
       },
-      required: ['doctorName']
+      required: []
+    }
+  },
+  {
+    name: 'search_clinic_or_provider',
+    description: 'Resolve a clinic/group/DBA name via CMS NPPES (NPI-2 organization search) to official name, NPI(s), addresses, phones, aliases. Optional fetch of a known clinic website/insurances page the agent already has (or the confirmed MNRS page). Never scrape Google/Bing SERPs. Use when lookup_provider_network misses a clinic name (e.g. Miami Neurology & Rehab Specialists → MNRS / NPI 1689860280). Then re-run lookup_provider_network with npi=. A clinic insurances-accepted page is marketing, not verified In/Out. If a askedCarrier logo IS on the page: say "Found a {carrier} logo on their site — here\'s the link. I recommend you call and confirm." If it is NOT (MNRS has no Humana): say "{carrier} is not listed on their accepted-insurances page" + link + recommend calling the office. Absence on the clinic site is not definitive OON if Find Care later returns IN — report both: not listed on clinic site + NPI Find Care result.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Clinic, group, or DBA name, e.g. "Miami Neurology & Rehab Specialists" or "MNRS Physical Therapy".' },
+        npi: { type: 'string', description: 'Optional 10-digit NPI if already known.' },
+        zip: { type: 'string', description: 'Optional ZIP to rank nearby locations (not a hard CMS filter).' },
+        city: { type: 'string', description: 'Optional city, e.g. Miami or South Miami.' },
+        state: { type: 'string', description: 'State code, defaults to FL', default: 'FL' },
+        siteUrl: { type: 'string', description: 'Optional clinic page URL to fetch for aliases/NPI/insurance logos, e.g. https://miamiphysicaltherapy.com/insurances/ — not a Google search URL.' },
+        askedCarrier: { type: 'string', description: 'Carrier the agent is checking (e.g. Humana, UHC). Used to say whether that logo is on the insurances page. Not a network determination.' }
+      },
+      required: ['name']
+    }
+  },
+  {
+    name: 'discover_similar_plans',
+    description: 'Shortlist Medicare Advantage plan candidates (carrier + plan name + plan ID when available) for a Florida ZIP/county outside or beyond THEI grid coverage (Miami-Dade/Broward). Uses Sunfire when credentials are set, and always returns a medicare.gov Plan Compare starter URL. Use when the agent asks for similar plans in another county (e.g. Alachua, Orange, Hillsborough, Palm Beach) or an out-of-area ZIP, including building a client-facing comparison sheet. For client-facing comparisons: mirror Yahoska Arias Lazo export layout (client name title; optional Plan Terminating; plan columns marketing name + contract-PBP; Doctors In network/Out of network via lookup_provider_network; Rx via lookup_formulary — Daisy / paste "Tier X" discarded). Ask for full name first (never invent / never "Client"). Working client sheet id 17yvEEoToayROnm6jR0sIfk9IbxJwVYWVhiqOJzsiCBc (in-progress Drs/Rx). Finished-comp archive 1zer8DxamS9GFdp9tHqWSB4S0bPjHbyU2Jyi6exBn31A is not a formulary or 2027 benefit-grid source. Does NOT invent benefit dollars. Does NOT rank or recommend a best plan (TPMO). Pass referenceSummary of the client\'s current benefits for LLM-side matching against returned candidates only.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        zip: { type: 'string', description: '5-digit Florida ZIP, e.g. "32601"' },
+        county: { type: 'string', description: 'Florida county name, e.g. "Alachua", "Palm Beach", "Orange"' },
+        year: { type: 'number', description: 'Plan year, default 2027 (AEP)' },
+        planType: { type: 'string', description: 'Optional plan type filter, e.g. "MAPD", "MA", "SNP"' },
+        referenceSummary: { type: 'string', description: 'Short text of the client\'s current plan benefits for similarity matching against returned candidates only' }
+      },
+      required: ['zip']
     }
   },
   {
     name: 'search_drug',
-    description: 'Search for a drug by name to get NDC code and drug ID. Use when an agent asks about a medication name, spelling, or NDC code.',
+    description: 'Sunfire drug catalog only (name / NDC / drug id). Does NOT return a plan formulary tier. Daisy / paste "Tier X" is discarded. For tier / PA / ST / coverage on a named plan, call lookup_formulary (or pass planId/planIds here).',
     input_schema: {
       type: 'object',
       properties: {
-        name: { type: 'string', description: 'Drug name or partial name, e.g. "metformin", "lisinopril"' }
+        name: { type: 'string', description: 'Drug name or partial name, e.g. "metformin", "trintellix"' },
+        ndc: { type: 'string', description: 'Optional NDC if the agent has it' },
+        planId: { type: 'string', description: 'Optional CMS contract-PBP. If set, also runs lookup_formulary for that plan.' },
+        planIds: { type: 'array', items: { type: 'string' }, description: 'Optional list of CMS IDs to formulary-check in the same call' },
+        year: { type: 'number', description: 'Plan year. Default 2027.' },
+        claimedTier: { type: 'number', description: 'Discarded. Daisy / paste tier labels are never stored or quoted.' }
       },
       required: ['name']
     }
+  },
+  {
+    name: 'lookup_formulary',
+    description: 'REQUIRED before quoting a drug tier, PA/ST, or T4 % cost. Looks up each drug × plan contract-PBP for the plan year (default 2027): Sunfire when SUNFIRE_JWT works, then Humana FHIR only if PlanID+year match this PBP, then medicare.gov Plan Compare, then carrier consumer documents (Doctors 2027 formulary PDF for H4140; 001→022, 012→023). Attaches T1–T6 cost-share from THEI 2027 Hub/grid knowledge. Daisy / paste "Tier X" is discarded — never quote or imply it. If lookup fails, return unverified. When a brand is verified not covered, automatically looks up the known generic (Lipitor→Atorvastatin, Benicar→Olmesartan) — do not wait for the agent to type the generic. Brand shows not covered with the asterisk note; generic tier comes from that live follow-up only — never invent a tier. Call once per drug (pass all named planIds).',
+    input_schema: {
+      type: 'object',
+      properties: {
+        drugName: { type: 'string', description: 'Drug name, e.g. "Trintellix" or "Atorvastatin"' },
+        ndc: { type: 'string', description: 'Optional NDC' },
+        planId: { type: 'string', description: 'CMS contract-PBP, e.g. "H1036-054C"' },
+        planIds: { type: 'array', items: { type: 'string' }, description: 'Compared / user-named CMS IDs only (typically 2–8, never the whole Florida grid)' },
+        year: { type: 'number', description: 'Plan year, default 2027' },
+        claimedTier: { type: 'number', description: 'Discarded. Never quoted or used.' }
+      },
+      required: ['drugName']
+    }
+  },
+  {
+    name: 'lookup_sob_benefit',
+    description: 'REQUIRED when the agent asks for ANY benefit that is not on the THEI Plan Comparison Grid (most-requested rows only). Do NOT call this on every comparison and do NOT look up benefits she did not ask for. Reads that plan\'s Summary of Benefits for the asked year (2026-only ask → #plan-data-2026 sobUrl; unspecified / 2027 / both years → 2027 #plan-data sobUrl). If the SOB does not have the asked benefit, read that same year\'s Evidence of Coverage (eocUrl). A 2026-only ask must not use a 2027 EOC. Quote only text the document said. Grid green cells first. Then SOB. Then EOC. Never invent a dollar amount. If it is not in either document, return unverified — never fill from the other year or memory. Pass planId/planIds plus sobUrl/eocUrl or the plan objects from PLAN DATA. Call once per comparison. Pass ONLY the compared / user-named contract-PBPs (typically 2–8, hard cap 10). NEVER pass the entire Florida grid (H1019-*, H1045-*, H1290-*, H1036-* dump). Pass year=2026 only when the agent asked 2026 and did not also say 2027.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        planId: { type: 'string', description: 'CMS contract-PBP, e.g. H1036-054C' },
+        planIds: { type: 'array', items: { type: 'string' }, description: 'Compared / user-named CMS IDs only (2–8 typical, never the whole Florida grid)' },
+        sobUrl: { type: 'string', description: 'Official SOB PDF URL when looking up a single plan' },
+        eocUrl: { type: 'string', description: 'Official Evidence of Coverage PDF URL when the SOB misses the asked benefit' },
+        plans: {
+          type: 'array',
+          items: { type: 'object' },
+          description: 'Plan objects from PLAN DATA (planId, sobUrl, eocUrl, hearing, …)',
+        },
+        benefits: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Asked off-grid benefits only: hearing_aids, skilled_nursing, dme, chemotherapy, home_health, dialysis, or a free-text slug',
+        },
+        query: { type: 'string', description: 'Free-text asked need, e.g. chemotherapy, SNF days 21-100' },
+        year: { type: 'number', description: 'Plan year. 2026 only when the ask is 2026 and not 2027. Default 2027.' },
+      },
+    },
   }
 ];
 
 // Process tool calls (async to support live lookups)
-async function processTool(toolName, toolInput) {
+async function processTool(toolName, toolInput, context = {}) {
   if (toolName === 'search_knowledge') {
     const results = searchKnowledge(toolInput.query);
     if (!results.length) return 'No results found for that query.';
@@ -179,202 +325,151 @@ async function processTool(toolName, toolInput) {
     const doc = getKnowledgeByKey(toolInput.key);
     return doc || `Document "${toolInput.key}" not found.`;
   }
+  if (toolName === 'search_clinic_or_provider') {
+    try {
+      const npiHint = toolInput.npi ? String(toolInput.npi) : '';
+      return await searchClinicOrProvider({
+        name: [toolInput.name || toolInput.clinicName || '', npiHint].filter(Boolean).join(' '),
+        state: toolInput.state || 'FL',
+        zip: toolInput.zip,
+        city: toolInput.city,
+        siteUrl: toolInput.siteUrl || toolInput.url,
+        askedCarrier: toolInput.askedCarrier || toolInput.carrier,
+      });
+    } catch (e) {
+      return `Clinic search error: ${e.message}`;
+    }
+  }
   if (toolName === 'lookup_provider_network') {
     try {
-      const doctorName = toolInput.doctorName || '';
-      const zip = toolInput.zip || '33136';
-      // Strip titles: dr, dr., mrs., mr., ms., dds, md, do, np, pa
-      const cleanName = doctorName.trim().replace(/^(dr\.?|mr\.?|mrs\.?|ms\.?|dds\.?|md\.?|do\.?|np\.?|pa\.?)\s+/i, '');
-      const nameParts = cleanName.split(/\s+/);
-      const lastName = nameParts[nameParts.length - 1];
-      const firstName = nameParts.length > 1 ? nameParts[0] : '';
-      // Step 1: NPI Registry lookup — try multiple name formats for compound last names
-      let results = [];
-      const namesToTry = [
-        { last: lastName, first: firstName },                              // e.g. Calle, Gilda
-        { last: nameParts.slice(1).join(' '), first: nameParts[0] },       // e.g. De La Calle, Gilda
-        { last: nameParts.slice(-2).join(' '), first: firstName },         // e.g. La Calle, Gilda
-        { last: lastName, first: '' },                                     // last name only
-      ];
-      for (const attempt of namesToTry) {
-        if (!attempt.last) continue;
-        const npiParams = new URLSearchParams({ version: '2.1', last_name: attempt.last, state: 'FL', enumeration_type: 'NPI-1', limit: '5' });
-        if (attempt.first) npiParams.set('first_name', attempt.first);
-        const npiRes = await fetch(`https://npiregistry.cms.hhs.gov/api/?${npiParams}`, { signal: AbortSignal.timeout(10000) });
-        const npiData = await npiRes.json();
-        results = npiData.results || [];
-        if (results.length) break;
-      }
-      if (!results.length) return `No providers found matching "${doctorName}" in Florida. Try a different spelling.`;
-      // Step 2: FHIR lookup for each NPI
-      const CARRIERS = [
-        { name: 'Florida Blue', key: 'flblue', base: 'https://apigw.bcbsfl.com/interop/interop-developer-portal/emr/api/v1/fhir' },
-        { name: 'Cigna', key: 'cigna', base: 'https://fhir.cigna.com/ProviderDirectory/v1' },
-        { name: 'HealthSun', key: 'healthsun', base: 'https://api.aaneelconnect.com/cms/r4/providerdirectory', extra: 'payer-id=8d4e5e9ec9c64b1a9db68fbec4bd6f95' },
-        { name: 'Devoted Health', key: 'devoted', base: 'https://fhir.devoted.com/r4' },
-      ];
-      const providerResults = [];
-      for (const p of results.slice(0, 3)) {
-        const npi = p.number;
-        const pName = `${p.basic?.first_name || ''} ${p.basic?.last_name || ''}`.trim();
-        const spec = (p.taxonomies || []).find(t => t.primary)?.desc || 'Unknown';
-        const addr = (p.addresses || []).find(a => a.address_purpose === 'LOCATION') || {};
-        const inNetworkFor = [];
-        for (const carrier of CARRIERS) {
-          try {
-            const url = carrier.extra
-              ? `${carrier.base}/PractitionerRole?practitioner.identifier=${npi}&${carrier.extra}`
-              : `${carrier.base}/PractitionerRole?practitioner.identifier=${npi}`;
-            const r = await fetch(url, { headers: { Accept: 'application/fhir+json' }, signal: AbortSignal.timeout(8000) });
-            if (r.ok) {
-              const fd = await r.json();
-              if ((fd.total || 0) > 0 || (fd.entry || []).length > 0) {
-                inNetworkFor.push(carrier.name);
-              }
-            }
-          } catch(e) { /* skip carrier */ }
-        }
-        providerResults.push({ name: pName, npi, specialty: spec, address: `${addr.address_1 || ''}, ${addr.city || ''}, FL ${addr.postal_code || ''}`.trim(), inNetworkFor });
-      }
-      if (!providerResults.length) return `Found NPIs but no network data available.`;
-      // Step 3: Sunfire /v2/provider/list for UHC, Humana, WellCare, CarePlus, etc.
-      const SUNFIRE_BASE = 'https://www.sunfirematrix.com';
-      const SUNFIRE_JWT = process.env.SUNFIRE_JWT || '';
-      const SUNFIRE_SFP = process.env.SUNFIRE_SFP || '';
-      const sunfireInNetwork = []; // resolved plan name strings
-      if (SUNFIRE_JWT && SUNFIRE_SFP && providerResults.length > 0) {
-        try {
-          const sfProviders = providerResults.map(pr => ({
-            id: pr.npi, name: pr.name, firstName: pr.name.split(' ')[0], radius: 25, primaryDoctor: true
-          }));
-          const sfRes = await fetch(`${SUNFIRE_BASE}/v2/provider/list`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${SUNFIRE_JWT}`,  // unified Bearer format
-              'Content-Type': 'application/json',
-              'Cookie': `sfp-cookie=${SUNFIRE_SFP}`,
-              'Origin': SUNFIRE_BASE,
-              'Referer': `${SUNFIRE_BASE}/app/agent/yourmedicare/`
-            },
-            body: JSON.stringify({
-              type: 'network', county: '12086', year: 2026, zip: '33136',
-              providers: sfProviders, restrictedProviderCarrierId: ''
-            }),
-            signal: AbortSignal.timeout(15000)
-          });
-          if (sfRes.ok) {
-            const sfData = await sfRes.json();
-            const sfPlans = sfData.plans || [];
-            for (const plan of sfPlans) {
-              const docs = plan.doctorInformation || [];
-              const covered = docs.some(doc =>
-                doc.covered === 'Y' && (doc.locations || []).some(l => l.covered === 'Y')
-              );
-              if (!covered) continue;
-              const id = String(plan.id);
-              const mapEntry = SUNFIRE_PLAN_MAP[id];
-              let label;
-              if (mapEntry) {
-                label = mapEntry.planName
-                  ? `${mapEntry.planName} (${mapEntry.carrier})`
-                  : (mapEntry.carrier || `Plan ${id}`);
-              } else {
-                label = `Plan ID ${id}`;
-              }
-              if (!sunfireInNetwork.includes(label)) sunfireInNetwork.push(label);
-            }
-          }
-        } catch(e) { console.log('[Sunfire lookup error]', e.message); }
-      }
-
-      let out = `Provider network results for "${doctorName}":\n\n`;
-      for (const pr of providerResults) {
-        out += `**${pr.name}** (NPI: ${pr.npi})\n`;
-        out += `Specialty: ${pr.specialty}\n`;
-        out += `Address: ${pr.address}\n`;
-        const allNetworks = [...pr.inNetworkFor];
-        if (sunfireInNetwork.length > 0) {
-          out += allNetworks.length ? `FHIR networks: ${allNetworks.join(', ')}\n` : `Not found in FL Blue, Cigna, HealthSun, or Devoted.\n`;
-          out += `Sunfire in-network plans (${sunfireInNetwork.length}):\n${sunfireInNetwork.map(p => `  - ${p}`).join('\n')}\n`;
-        } else {
-          out += allNetworks.length ? `In-network for: ${allNetworks.join(', ')}\n` : `Not found in FL Blue, Cigna, HealthSun, or Devoted networks.\n`;
-          out += SUNFIRE_SFP ? `Sunfire: No active plans found.\n` : `Sunfire: Session expired — refresh credentials for UHC/Humana/WellCare/CarePlus.\n`;
-        }
-        out += '\n';
-      }
-      // Build structured output for frontend (v11 toolResults schema)
-      const firstProvider = providerResults[0];
-      const structured = firstProvider ? {
-        doctorName: firstProvider.name,
-        npi: firstProvider.npi,
-        networks: CARRIERS.map(c => ({
-          carrier: c.name,
-          inNetwork: firstProvider.inNetworkFor.includes(c.name)
-        }))
-      } : { doctorName, networks: [] };
-      return { text: out.slice(0, 4000), structured };
+      // Single doctor or doctors[] batch — all doctors/NPIs/carriers run in parallel
+      // and the call returns by context.deadlineAt with finished results + NOT CONFIRMED.
+      return await lookupProviderNetwork(toolInput, context);
     } catch (e) { return `Provider lookup error: ${e.message}`; }
   }
-  if (toolName === 'search_drug') {
+  if (toolName === 'discover_similar_plans') {
     try {
-      const prefix = encodeURIComponent(toolInput.name.toLowerCase().slice(0, 20));
-      const res = await fetch(`https://www.sunfirematrix.com/v2/drug/search/${prefix}/-1`, {
-        headers: { 'Authorization': `Bearer ${process.env.SUNFIRE_JWT || ''}`, 'Accept': 'application/json' }, // unified Bearer format
-        signal: AbortSignal.timeout(10000)
+      const result = await discoverPlansForArea({
+        zip: toolInput.zip,
+        county: toolInput.county,
+        year: toolInput.year || Number(UHC_PLAN_YEAR),
+        planType: toolInput.planType,
+        referenceSummary: toolInput.referenceSummary,
       });
-      if (!res.ok) return `Drug search unavailable (${res.status}).`;
-      const data = await res.json();
-      const drugs = data.drugs || [];
-      if (!drugs.length) return `No drugs found matching "${toolInput.name}". Try a different spelling.`;
-      return `Found ${drugs.length} drug(s) matching "${toolInput.name}":\n` + drugs.slice(0, 10).map(d => `- ${d.name} (NDC: ${d.ndc})`).join('\n');
-    } catch (e) { return `Drug search error: ${e.message}`; }
+      const lines = [];
+      lines.push(`Plan discovery for ZIP ${result.zip}` + (result.county ? ` (${result.county})` : '') + `, year ${result.year}:`);
+      lines.push(`Source: ${result.source || 'none'}`);
+      lines.push(`Plan Compare (enter ZIP ${result.zip} manually): ${result.planCompareUrl}`);
+      if (result.countyFips) lines.push(`County FIPS: ${result.countyFips}`);
+      if (result.plans && result.plans.length) {
+        lines.push(`Candidates (${result.plans.length}, not ranked — TPMO: do not pick a "best"):`);
+        for (const pl of result.plans) {
+          const idPart = pl.planId ? ` [${pl.planId}]` : '';
+          const sfPart = pl.sunfireId ? ` (Sunfire ${pl.sunfireId})` : '';
+          lines.push(`  - ${pl.carrier}: ${pl.planName}${idPart}${sfPart}`);
+        }
+      } else {
+        lines.push('No Sunfire candidates returned. Use Sunfire broker portal and/or Plan Compare.');
+      }
+      if (result.note) lines.push(`Note: ${result.note}`);
+      if (result.errors && result.errors.length) lines.push(`Errors: ${result.errors.join('; ')}`);
+      if (result.referenceSummary) lines.push(`referenceSummary (echo): ${result.referenceSummary}`);
+      lines.push('THEI benefit grid does not cover this county. Do not invent premiums/MOOP/dental from memory. Agent verifies in Sunfire/SOB/Plan Compare.');
+      return { text: lines.join('\n').slice(0, 8000), structured: result };
+    } catch (e) {
+      return `Plan discovery error: ${e.message}`;
+    }
+  }
+  if (toolName === 'search_drug' || toolName === 'lookup_formulary') {
+    try {
+      const drugName = toolInput.drugName || toolInput.name || '';
+      const planIds = []
+        .concat(toolInput.planId || [])
+        .concat(toolInput.planIds || [])
+        .filter(Boolean);
+      const wantsFormulary = toolName === 'lookup_formulary' || planIds.length > 0;
+      if (!wantsFormulary) {
+        const result = await lookupFormulary({
+          drugName,
+          ndc: toolInput.ndc,
+          year: toolInput.year || 2027,
+        });
+        const catalog = (result.catalog || []).slice(0, 10);
+        if (!catalog.length) {
+          const err = result.catalogError ? ` (${result.catalogError})` : '';
+          return `No drugs found matching "${drugName}"${err}. Catalog only — call lookup_formulary with a plan ID before quoting a tier.`;
+        }
+        return (
+          `Found ${catalog.length} catalog match(es) for "${drugName}" (name/NDC only — tiers NOT verified):\n` +
+          catalog.map((d) => `- ${d.name}${d.ndc ? ` (NDC: ${d.ndc})` : ''}`).join('\n') +
+          `\nCatalog only — call lookup_formulary with drugName + planIds before quoting a tier.`
+        );
+      }
+      // Never price drugs on the plan the agent said is terminating / skipped.
+      const { skip: skipIds } = askConstraints(conversationAskText(context.messages || []));
+      const keepId = (id) => !skipIds.has(String(id || '').toUpperCase().replace(/[A-Z]$/, '')) && !skipIds.has(String(id || '').toUpperCase());
+      const keptPlanId = toolInput.planId && keepId(toolInput.planId) ? toolInput.planId : undefined;
+      const keptPlanIds = (Array.isArray(toolInput.planIds) ? toolInput.planIds : []).filter(keepId);
+      if (!keptPlanId && !keptPlanIds.length && planIds.length) {
+        return `Skipped ${drugName}: every plan asked (${planIds.join(', ')}) is terminating or excluded by the agent. Check the meds on the 2027 candidates instead.`;
+      }
+      // Same 24h drug × plan cache as Compare mode (tiers don't change mid-season).
+      const ids = [...(keptPlanId ? [keptPlanId] : []), ...keptPlanIds];
+      const result = toolInput.ndc
+        ? await lookupFormulary({ drugName, ndc: toolInput.ndc, planId: keptPlanId, planIds: keptPlanIds, year: toolInput.year || 2027 })
+        : await require('./compareJobs').lookupFormularyCached({ drugName, planIds: ids, year: toolInput.year || 2027 });
+      return {
+        text: formatFormularyText(result),
+        structured: { ...result, drug: toExportDrug(result), drugs: toExportDrugs(result) },
+      };
+    } catch (e) {
+      return `Formulary lookup error: ${e.message}. Do not quote a tier.`;
+    }
+  }
+  if (toolName === 'lookup_sob_benefit') {
+    try {
+      // Only look up the known off-grid benefits (SNF, hearing, DME, home health, dialysis, chemo...) the agent
+      // typed herself — Max's own replies and a bare "Show benefits" never justify them (Yahoska, 2026-10-07).
+      let benefits = toolInput.benefits;
+      if (Array.isArray(benefits) && benefits.length && Array.isArray(context.messages)) {
+        const askedKeys = new Set(normalizeBenefitList(askedOffGridFromText(userPlainText(context.messages)).benefits));
+        const KNOWN = new Set(['skilledNursing', 'hearingAids', 'dme', 'dmeHospitalBed', 'hospitalBed', 'homeHealth', 'dialysis', 'chemotherapy', 'chemo']);
+        benefits = normalizeBenefitList(benefits).filter((k) => !KNOWN.has(k) || askedKeys.has(k));
+        if (!benefits.length) {
+          return 'No off-grid benefit lookup run: the agent did not ask for SNF, hearing aids, DME, home health, dialysis or chemo in her own messages. Do not look them up or show them; show only the grid benefits.';
+        }
+      }
+      const result = await lookupSobBenefits({
+        planId: toolInput.planId,
+        planIds: toolInput.planIds,
+        sobUrl: toolInput.sobUrl,
+        eocUrl: toolInput.eocUrl,
+        plans: toolInput.plans,
+        benefits,
+        query: toolInput.query,
+        year: toolInput.year,
+        askText: context.askText || conversationAskText(context.messages),
+        systemText: context.system,
+        budgetMs: toolInput.budgetMs || (Number(context.remainingMs) > 0
+          ? Math.min(28000, Math.max(4000, Number(context.remainingMs) - 8000))
+          : undefined),
+      });
+      return {
+        text: formatSobLookupText(result),
+        structured: { ...result, sobBenefits: toExportSobBenefits(result) },
+      };
+    } catch (e) {
+      return `SOB lookup error: ${e.message}. Do not invent a dollar amount.`;
+    }
   }
   return 'Unknown tool.';
 }
 
 async function chat(messages) {
-  // LEGACY MODE — KB-search path. Pass-through is handled in server.js.
-  // Scheduled for retirement once nothing depends on it.
+  // LEGACY MODE — delegates to Grok. Pass-through is handled in server.js.
   loadKnowledge();
-
-  const apiMessages = [...messages];
-  let response;
-
-  // Agentic loop — handle tool calls
-  for (let i = 0; i < 5; i++) {
-    response = await client.messages.create({
-      model: process.env.CLAUDE_MODEL || 'claude-haiku-4-5',
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      tools: TOOLS,
-      messages: apiMessages,
-    });
-
-    if (response.stop_reason !== 'tool_use') break;
-
-    // Process tool calls
-    const assistantMsg = { role: 'assistant', content: response.content };
-    apiMessages.push(assistantMsg);
-
-    const toolResults = [];
-    for (const block of response.content) {
-      if (block.type === 'tool_use') {
-        console.log(`[Tool] ${block.name}(${JSON.stringify(block.input)})`);
-        const result = await processTool(block.name, block.input);
-        const resultText = (result && typeof result === 'object' && result.text) ? result.text : result;
-        toolResults.push({
-          type: 'tool_result',
-          tool_use_id: block.id,
-          content: resultText,
-        });
-      }
-    }
-    apiMessages.push({ role: 'user', content: toolResults });
-  }
-
-  // Extract text reply
-  const textBlock = response.content.find(b => b.type === 'text');
-  return textBlock?.text || "I'm having trouble right now — please try again.";
+  const { chat: grokChat } = require('./grok');
+  return grokChat(messages, SYSTEM_PROMPT);
 }
 
-module.exports = { chat, TOOLS, processTool };
+module.exports = { chat, TOOLS, processTool, SYSTEM_PROMPT };

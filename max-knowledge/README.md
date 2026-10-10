@@ -1,42 +1,66 @@
 # Max Knowledge Base
 
-Knowledge documents for the Max Medicare AI assistant.  
-These files get imported into Max's data layer when the system is deployed.
+Knowledge documents for **Max** (THEI Medicare guru — not Igor). Railway loads these for `search_knowledge` / `get_knowledge_doc`.
 
-## Structure
+Cursor / desk brief: repo-root [MAX.md](../MAX.md) (read that first). Identity: [AGENTS.md](../AGENTS.md). Watcher prompt: [WATCHER.md](../WATCHER.md).
+
+## Layout
 
 ```
 max-knowledge/
-├── carriers/          # Per-carrier plan rules, transitions, non-commissionables
-├── compliance/        # CMS rules, TPMO, SEP guidance
-├── benefits/          # Benefit details by plan/carrier
-└── operations/        # Enrollment procedures, contacts, certifications
+├── hub/                 # Agent Medicare Hub pack (bot version of the Hub)
+│   ├── seps-by-state/   # SEP tracker split by state (use FL for Florida)
+│   ├── sep-tracker.md   # Full SEP snapshot
+│   ├── compliance.md
+│   ├── medicare-basics.md
+│   └── ...
+├── carriers/            # Per-carrier notes, non-commissionables, blackouts
+└── *.md                 # Medicare reference, hospitals, contacts, behavior rules
 ```
 
-## Files
+## How to add to the KB
 
-### carriers/
-| File | Content | Updated |
-|------|---------|---------|
-| `elevance-simply-plan-transitions-noncommissionable.md` | Simply Healthcare plan transitions (1/1/2026) + non-commissionable plan list + agent Q&A | 2026-07-10 |
-| `humana-noncommissionable-florida-2026.md` | Official Humana carrier doc — all FL non-commissionable plans across 3 effective date batches (1/1, 4/1, 6/1). THEI grid cross-reference included. | 2026-07-10 |
-| `florida-noncommissionable-plans-2026.md` | Full FL non-commissionable MA plan list — all carriers, from CMS 4.1.2026 landscape files. 36 non-commissionable plans, 529K enrolled. | 2026-07-10 |
-| `thei-plan-grid-noncommissionable.md` | The 11 non-commissionable plans within THEI's 147-plan grid, with data schema for backend import. | 2026-07-10 |
-| `max-behavior-rules.md` | Max system prompt rules — how to handle non-commissionable plans during comparisons (neutral heads-up, never ranking factor, renewal/new-sale distinction). | 2026-07-10 |
+Live Max only searches files under `max-knowledge/`. Root `MAX.md` is for Cursor Max, not the chatbot.
 
-## How to use (once Max is deployed)
-These markdown files get chunked and indexed into Max's retrieval layer.  
-Each file should be self-contained with enough context for Max to answer agent questions accurately.
+1. **Add or edit a `.md` file** under `max-knowledge/` (or `max-knowledge/carriers/` for one carrier).
+2. **Name it so search hits.** The tool key is the path without `.md`:
+   - `max-knowledge/plan-year-2027.md` → `plan-year-2027`
+   - `max-knowledge/carriers/humana-plans-florida-2027.md` → `carriers/humana-plans-florida-2027`
+3. **Put the year, carrier, county, and CMS IDs in the title and first lines** (`Humana`, `2027`, `H1036-054`, `Miami-Dade`). Search is plain text, not semantic.
+4. **Cite the source** at the top (SoB URL, Hub page, date). Yellow / unconfirmed facts stay out.
+5. **Merge to `main` and let Railway redeploy.** The KB loads from disk on boot. There is no admin “upload a note” button. Only the SEP pack hot-reloads (`POST /admin/refresh-seps` or the 24h job).
+6. **Ask Max the question** after deploy. If he misses it, the filename or first heading probably lacks the words you used.
 
----
+Live `#plan-data` **defaults to 2027** (non-yellow cells). Also write confirmed 2027 numbers into a `*2027*.md` file so `search_knowledge` can cite them. 2026 stays in `#plan-data-2026`.
 
-## ⚠️ NOT Max's source of truth as of 2026-07-17
+The live 2027 working workbook is https://docs.google.com/spreadsheets/d/1Vz9XBPwTO3a7181otdTf_NFkZFCXK4OT8O05ooeB0xg/edit (yellow = leftover/unconfirmed; white/uncolored or classic green = working 2027). Refresh with `python3 scripts/sync_thei_grid_to_max.py --year 2027` and `python3 scripts/export_2027_grid_to_kb.py`. Index: `carriers/plan-grid-overview-2027`. **HealthSpring / Cigna is not a 2027 Miami-Dade or Broward MA option** — leftover yellow cells are stale; cite `carriers/healthspring-plans-florida-2027`.
 
-As of the proxy switch (commit f538f86), **Max's plan data lives in `max-demo-FINAL_4.html`**, not here.
+Dental procedure sub-rows (Crowns, Bridges, Implants, …) are kept on export when the cell has a clear frequency, even if still yellow. Vague `$0 varies` is not exported; the clearer sibling county for the same CMS ID is used. CarePlus CareComplete H1019-150: `carriers/careplus-carecomplete-h1019-150`.
 
-This folder is kept for:
-- Other tools that may search it
-- Human-readable reference
+Hub pages (compliance, AEP training, etc.): update the Hub repo, then `python3 scripts/import_hub_knowledge.py` (clone `agent-medicare-hub` to `/tmp/amh` first). SEPs: `python3 scripts/refresh_sep_tracker.py`.
 
-Do not update these markdown files expecting Max to pick up the changes.
-To update Max's knowledge, update `max-demo-FINAL_4.html` and redeploy to Netlify.
+## Plan grid vs Hub pack
+
+| Need | Source |
+|------|--------|
+| Plan premiums, MOOP, copays, drug tiers, givebacks | Embedded PLAN DATA in `artifacts/max-demo-FINAL-v7.html` (THEI grid) |
+| SEPs, compliance, SOA, certs, contracting, Hub ops | `max-knowledge/hub/*` via tools |
+
+## Refresh Hub content
+
+```bash
+# SEP tracker (live Hub app — preferred; keeps Max in sync with agentmedicarehub.com)
+python3 scripts/refresh_sep_tracker.py
+
+# Other Hub pages (clone agent-medicare-hub to /tmp/amh first):
+python3 scripts/import_hub_knowledge.py
+```
+
+SEP SoT is the live tracker HTML (`sep-tracker-app.html` /
+https://www.agentmedicarehub.com/sep-tracker), not the older
+`sep-tracker/data/seps.json` snapshot.
+
+### Auto-refresh (production)
+
+1. **Railway (runtime):** on boot + every `SEP_REFRESH_HOURS` (default **24**), Max pulls the live Hub tracker into `max-knowledge/hub/*` and reloads the in-memory KB. Disable with `SEP_REFRESH_ENABLED=false`. Manual: `POST /admin/refresh-seps` (requires API key + access token when gated).
+2. **GitHub Actions (repo):** weekly Monday job opens a PR if the Hub changed, so deploys/cold starts stay current even before the runtime pull.
